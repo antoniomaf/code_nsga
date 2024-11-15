@@ -1,1 +1,2128 @@
+import matplotlib.pyplot as plt
+import logging, random, time
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import os, csv
+import json
+import mysql.connector
+import ast
+import paramiko
+import io, sys  
+import random
+from mysql.connector import Error, InterfaceError, DatabaseError
+from deap import base, creator, tools, algorithms
+from pandas.plotting import parallel_coordinates
+from multiprocessing import Pool
+from scipy.interpolate import griddata
+from xml.etree import ElementTree as ET
+from lxml import etree 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from mysql.connector import pooling
+from deap.tools import uniform_reference_points
+from deap.tools._hypervolume import hv
 
+class SensorPositioningProblem:    
+    def __init__(self, db_config):
+        self.db_config = db_config
+        self.init_pop_from_db()
+        
+    # Inicializa uma população de indivíduos (ou dispositivos) a partir de dados recuperados do banco de dados,
+    # especificamente da tabela de dispositivos (tb_devices). A população é composta por dispositivos que ainda não foram processados (processed = FALSE). 
+    def init_pop_from_db(self):
+        connection = None        
+        try:
+            connection = mysql.connector.connect(**self.db_config)
+            if connection.is_connected():
+                cursor = connection.cursor()
+                cursor.execute("SELECT coordenada_x, coordenada_y, id_device FROM `sensors`.tb_devices WHERE processed = FALSE ORDER BY id_device DESC LIMIT 126")
+                rows = cursor.fetchall()
+                
+                self.load_pop = pd.DataFrame(rows, columns=['coordenada_x', 'coordenada_y', 'id_device'])
+                self.load_pop['parent_id'] = None  
+                self.load_pop['individual_id'] = (self.load_pop.index // 6) + 1
+        
+                logging.debug(f'População carregada: {self.load_pop.shape}')
+                logging.debug(f'Primeiras linhas da população carregada: {self.load_pop.head()}')
+
+        except mysql.connector.Error as e:
+            logging.error(f"Erro ao conectar no banco de dados MySQL: {e}")
+        finally:
+            if connection and connection.is_connected():
+                cursor.close()
+                connection.close()
+
+    # Retorna os 126 pares de coordenadas ou 21 individuos com base no campo "id_device" seguindo ordem crescente do menor valor 
+    # obtido neste campo até o maior valor, tendo como referência o último valore registrado no campo "generation"
+    #
+    def get_initial_pop(self):
+        pop = []
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor(buffered=True)
+
+            cursor.execute("""
+                SELECT id_device, coordenada_x, coordenada_y
+                FROM `sensors`.`tb_devices`
+                ORDER BY id_device DESC
+                LIMIT 126
+            """)
+            
+            all_devices = cursor.fetchall()
+            all_devices.reverse()
+            for i in range(0, len(all_devices), 6):
+                device_group = all_devices[i:i+6]
+                if len(device_group) < 6:
+                    continue
+                
+                individual_coords = []
+                fitness_values_list = [0.0] * 6  # Inicialize o fitness com 6 métricas
+                for device in device_group:
+                    individual_coords.extend([device[1], device[2]]) 
+                    
+                    cursor.execute("""
+                        SELECT energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s
+                        FROM `sensors`.`tb_metrics`
+                        WHERE id_device = %s
+                    """, (device[0],))
+                    fitness_values = cursor.fetchone()
+                    if fitness_values:
+                        fitness_values_list = [round(sum(x), 4) for x in zip(fitness_values_list, map(float, fitness_values))]
+                    else:
+                        fitness_values_list = [0.0] * 6
+
+                individual = create_individual(individual_coords)
+                print(f"Individual coordinates: {individual_coords}")
+                print(f"Fitness values length: {len(fitness_values_list)}")
+                print(f"Fitness values: {fitness_values_list}")
+                individual.fitness.values = tuple(fitness_values_list)
+                pop.append(individual)
+                
+                if len(pop) == 21:
+                    break
+
+        except mysql.connector.Error as e:
+            print(f"Erro ao carregar população e fitness: {e}")
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+
+        return pop
+
+    def evaluate_objective(self, individual):
+        coordinates = [(individual[i], individual[i + 1]) for i in range(0, len(individual), 2)]
+        fitness_default_error = (19.168, 25.8016, 2757.2, 0.11, 10.232, 0.11)  # Default error fitness com 6 valores
+        fitness = [0.0] * 6  # Inicializa o fitness com 6 métricas
+
+        for x, y in coordinates:
+            x = x.item() if isinstance(x, np.generic) else x
+            y = y.item() if isinstance(y, np.generic) else y
+            if not (MIN_X <= x <= MAX_X) or not (MIN_Y <= y <= MAX_Y):
+                logging.error(f"Coordenadas fora do alcance: ({x}, {y}).")
+                return fitness_default_error
+
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor(buffered=True)
+            for x, y in coordinates:
+                x_native, y_native = float(x), float(y)
+                if not self.check_neighbors(x_native, y_native, cursor):
+                    logging.info(f"Nenhum dispositivo vizinho encontrado dentro do alcance TX para as coordenadas: ({x_native}, {y_native}).")
+                    return fitness_default_error
+                metrics = self.update_fitness(x_native, y_native, cursor, fitness)
+                if not metrics:
+                    logging.error(f"Nenhum dado encontrado para as coordenadas fornecidas: ({x}, {y}).")
+                    return fitness_default_error
+                fitness = [round(sum(x), 4) for x in zip(fitness, metrics)]  # Soma as métricas e arredonda para 4 casas decimais                
+
+        except mysql.connector.Error as e:
+            logging.error(f"Erro 1 no banco de dados: {e}")
+            return fitness_default_error
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+
+        if any(np.isnan(f) for f in fitness):
+            return fitness_default_error
+        return tuple(fitness)
+
+    def check_neighbors(self, x, y, cursor):
+        tx_range_query = """
+        SELECT EXISTS(
+            SELECT 1 FROM `sensors`.tb_devices
+            WHERE SQRT(POW(coordenada_x - %s, 2) + POW(coordenada_y - %s, 2)) <= 75
+            AND processed = TRUE
+        )
+        """
+        cursor.execute(tx_range_query, (x, y))
+        return cursor.fetchone()[0]
+
+    def update_fitness(self, x, y, cursor, fitness, index):
+        metrics_query = """
+        SELECT energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s
+        FROM tb_metrics m
+        JOIN tb_devices d ON m.id_device = d.id_device
+        WHERE ABS(d.coordenada_x - %s) <= %s AND ABS(d.coordenada_y - %s) <= %s
+        """
+        tolerance = 1e-4
+        cursor.execute(metrics_query, (x, tolerance, y, tolerance))
+        metrics = cursor.fetchone()
+        if not metrics:
+            return False
+        energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s = np.nan_to_num(metrics, nan=0.0, posinf=np.finfo(float).max, neginf=np.finfo(float).min)
+        fitness[index] += energest_cpu_j
+        fitness[index + 1] += total_energy_consumption_j
+        fitness[index + 2] += latency_s
+        fitness[index + 3] += -total_data_volume_kb  # Negativo para maximizar
+        fitness[index + 4] += response_time_s
+        fitness[index + 5] += -transfer_rate_kb_s  # Negativo para maximizar
+        return True
+    
+# DEAP Setup
+if not hasattr(creator, "FitnessMin"):    
+    creator.create("FitnessMin", base.Fitness, weights=(-1.0, -1.0, -1.0, 1.0, -1.0, 1.0))  # 6 métricas
+
+if not hasattr(creator, "Individual"):
+    creator.create("Individual", list, fitness=creator.FitnessMin)
+
+def create_pop(n, data):       
+    return [create_individual(row) for row in data[:n]]
+
+# Cria um indivíduo que é representado por uma lista de coordenadas (x e y), que pode ser gerada aleatoriamente ou a partir de dados fornecidos.
+def create_individual(data_row=None):
+    if data_row is None:
+        # Gera 12 valores aleatórios (6 pares de coordenadas x e y), arredondados para 2 casas decimais
+        # data_row = [round(random.uniform(0, 100), 2) for _ in range(12)]
+        data_row = [round(random.uniform(-20.0, 120.0), 2) for _ in range(12)]
+        
+    else:
+        # Arredonda os primeiros 12 valores do data_row para 2 casas decimais e garante que sejam floats
+        data_row = [round(float(val), 2) for val in data_row[:12]]
+    
+    return creator.Individual(data_row)  
+    
+# Verifica se um indivíduo completo (6 pares de coordenadas) existe no banco de dados + conexão com pool
+def check_individual_exists(ind):    
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+        
+        # Recupera todos os individual_id que atendem à condição de id_device >= 20545
+        cursor.execute("""
+            SELECT individual_id FROM sensors.tb_devices
+            WHERE id_device >= 20545
+            GROUP BY individual_id
+            HAVING COUNT(*) = 6  # Garante que cada indivíduo tem exatamente 6 dispositivos
+        """)
+        individual_ids = cursor.fetchall()
+        
+        # Cria uma lista de tuplas de coordenadas do novo indivíduo
+        ind_coords = [(ind[i], ind[i+1]) for i in range(0, len(ind), 2)]
+        
+        # Para cada individual_id encontrado, busca todos os dispositivos que compõem esse indivíduo
+        for (individual_id,) in individual_ids:
+            cursor.execute("""
+                SELECT coordenada_x, coordenada_y FROM sensors.tb_devices
+                WHERE individual_id = %s
+                ORDER BY id_device
+            """, (individual_id,))
+            devices = cursor.fetchall()
+
+            # Verifica se as coordenadas do indivíduo candidato correspondem a este indivíduo
+            if len(devices) == 6 and all(
+                abs(devices[i][0] - ind_coords[i][0]) < 1e-4 and
+                abs(devices[i][1] - ind_coords[i][1]) < 1e-4 for i in range(6)
+            ):
+                return True
+
+        return False
+    except mysql.connector.Error as e:
+        print(f"Erro ao verificar a existência do indivíduo: {e}")
+        return False
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+#Função de arredondamento:
+def round_coordinates(individual):    
+    for i in range(0, len(individual), 2):
+        individual[i] = round(individual[i], 2)  # Arredonda a coordenada x
+        individual[i + 1] = round(individual[i + 1], 2)  # Arredonda a coordenada y
+    return individual
+
+# Operadores Genéticos:
+#   Operação de cruzamento (ou recombinação) entre dois indivíduos (representados pelos parâmetros ind1 e ind2), 
+#   usando a técnica de Crossover Binário Simulado (SBX) limitada por valores mínimos e máximos.
+def custom_cxSimulatedBinaryBounded(ind1, ind2, eta, low, up):
+    size = min(len(ind1), len(ind2))
+    for i in range(0, size, 2):  # Itera em passos de 2 para pares de coordenadas
+        if random.random() <= 0.5:
+            for j in range(2):  # Aplica cruzamento em pares de coordenadas (x, y)
+                alpha = 2. * random.random() if random.random() <= 0.5 else 1. / (2. * random.random())
+                val1 = ind1[i + j]
+                val2 = ind2[i + j]
+                ind1[i + j] = 0.5 * ((1 + alpha) * val1 + (1 - alpha) * val2)
+                ind2[i + j] = 0.5 * ((1 - alpha) * val1 + (1 + alpha) * val2)
+
+                ind1[i + j] = round(min(max(ind1[i + j], low[i + j]), up[i + j]), 2)
+                ind2[i + j] = round(min(max(ind2[i + j], low[i + j]), up[i + j]), 2)
+
+    return ind1, ind2
+
+# Operadores Genéticos:
+#   Mutação Polinomial limitada em um indivíduo da população.
+def custom_mutPolynomialBounded(individual, eta2, low, up, indpb):
+    size = len(individual)
+    for i in range(0, size, 2):
+        for j in range(2):
+            if random.random() <= indpb:
+                x = individual[i + j]
+                delta_1 = (x - low[i + j]) / (up[i + j] - low[i + j])
+                delta_2 = (up[i + j] - x) / (up[i + j] - low[i + j])
+                rand = random.random()
+                mut_pow = 1.0 / (eta2 + 1.)
+
+                if rand < 0.5:
+                    xy = 1 - delta_1
+                    val = 2 * rand + (1 - 2 * rand) * (xy ** (eta2 + 1))
+                    delta_q = val ** mut_pow - 1 if val > 0 else 0
+                else:
+                    xy = 1 - delta_2
+                    val = 2 * (1 - rand) + 2 * (rand - 0.5) * (xy ** (eta2 + 1))
+                    delta_q = 1 - val ** mut_pow if val > 0 else 0
+
+                x = x + delta_q * (up[i + j] - low[i + j])
+                x = round(min(max(x, low[i + j]), up[i + j]), 2)
+                individual[i + j] = x
+
+    return individual,
+
+# Aplicando arredondamento após operações genéticas:
+def custom_varAnd(pop, toolbox, cxpb, mutpb):
+    offspring = []
+    for i in range(0, len(pop), 2):
+        if i + 1 < len(pop):
+            ind1, ind2 = pop[i], pop[i + 1]
+            if random.random() < cxpb:
+                ind1, ind2 = toolbox.mate(ind1, ind2)
+            offspring.append(toolbox.clone(ind1))
+            offspring.append(toolbox.clone(ind2))
+        else:
+            ind1 = pop[i]
+            if random.random() < cxpb:
+                ind1, _ = toolbox.mate(ind1, toolbox.clone(ind1))
+            offspring.append(toolbox.clone(ind1))
+    
+    for mutant in offspring:
+        if random.random() < mutpb:
+            toolbox.mutate(mutant)
+        del mutant.fitness.values
+        
+        # Arredonda as coordenadas de cada indivíduo
+        round_coordinates(mutant)
+    
+    return offspring
+
+# Reseta o estado de processamento de nós específicos em um banco de dados, marcando-os como não processados.
+def reset_processed_nodes(db_config):
+    """Reseta o estado de processamento do nó com id_device = 1 e os últimos 6 nós no banco de dados."""
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(buffered=True)
+
+        # Reseta o nó com id_device = 1
+        update_query_id_1 = "UPDATE `sensors`.tb_devices SET processed = FALSE WHERE id_device = 1"
+        cursor.execute(update_query_id_1)
+        
+        # Obtem os últimos 6 IDs (exceto o id_device = 1 para evitar duplicidade se ele estiver entre os últimos 6)
+        select_query_last_6 = "SELECT id_device FROM `sensors`.tb_devices WHERE id_device <> 1 ORDER BY id_device DESC LIMIT 6"
+        cursor.execute(select_query_last_6)
+        last_6_ids = cursor.fetchall()
+
+        # Reseta os últimos 6 IDs
+        for (id_device,) in last_6_ids:  # Desempacotamento do valor da tupla
+            update_query_last_6 = "UPDATE `sensors`.tb_devices SET processed = FALSE WHERE id_device = %s"
+            cursor.execute(update_query_last_6, (id_device,))
+            
+        conn.commit()
+        print("Nó com id_device = 1 e os últimos 6 nós foram resetados com sucesso.")
+    except Error as e:
+        print(f"Erro ao resetar os nós: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+            
+# Remove indivíduos duplicados de uma população com base em uma precisão especificada para o arredondamento dos valores dos atributos de cada indivíduo.
+# O arredondamento é necessário para tratar pequenas diferenças numéricas que não deveriam distinguir dois indivíduos como únicos, 
+# (por exemplo, 0.999999 e 1.000001 podem ser considerados o mesmo valor se a precisão for 6).
+def remove_duplicates(pop, precision=6):
+    unique_individuals = set()
+    non_duplicate_pop = []
+
+    for ind in pop:
+        # Crie uma tupla de valores arredondados para o indivíduo
+        rounded_ind = tuple(round(x, precision) for x in ind)
+
+        # Verifique se este indivíduo já está no conjunto
+        if rounded_ind not in unique_individuals:
+            unique_individuals.add(rounded_ind)
+            non_duplicate_pop.append(ind)
+
+    return non_duplicate_pop
+
+#  Utilizado para identificar as melhores soluções possíveis da população para posterior análise ou tomada de decisão.
+def identify_pareto_front(pop):
+    # Use o método sortNondominated do DEAP para obter a frente de Pareto
+    # pop: A população de indivíduos que será avaliada.
+    # len(pop): Quantos indivíduos devem ser considerados para a identificação da não-dominação. 
+    #           Aqui, passamos o tamanho da população inteira.
+    # first_front_only=True: O Valor "True" especifica que estamos interessados apenas na primeira frente de Pareto 
+    #                        (ou seja, o conjunto de soluções que não são dominadas por nenhuma outra solução na população). 
+    #                        Isso ajuda a focar no conjunto mais elite de soluções.
+    # Retorno da Frente de Pareto: Retorna apenas a primeira frente de Pareto, que é extraída com [0] 
+    # ao final da chamada ao sortNondominated.
+    
+    # Use o método sortNondominated do DEAP para obter a frente de Pareto
+    pareto_front = tools.sortNondominated(pop, len(pop), first_front_only=True)[0]
+
+    # Arredonda os valores de fitness para 4 casas decimais
+    for ind in pareto_front:
+        ind.fitness.values = tuple(round(val, 4) for val in ind.fitness.values)
+
+    return pareto_front
+
+# Retorna uma lista de listas, onde cada sublista contém indivíduos de diferentes níveis de frentes de Pareto.
+def identify_pareto_front_2(pop):
+    # first_front_only=False: Ao definir este parâmetro como False, a função não limita o retorno
+    #                         à primeira frente de Pareto (os indivíduos que são não-dominados por qualquer outro). Em vez disso, ela retorna uma 
+    #                         lista de listas, onde cada sublista contém indivíduos de diferentes níveis de frentes de Pareto.
+    
+    # first_front_only=False: Retorna uma lista de listas com indivíduos de diferentes níveis de frentes de Pareto
+    pareto_front_2 = tools.sortNondominated(pop, len(pop), first_front_only=False)
+
+    # Arredonda os valores de fitness para 4 casas decimais para cada indivíduo em todas as frentes de Pareto
+    for front in pareto_front_2:
+        for ind in front:
+            ind.fitness.values = tuple(round(val, 4) for val in ind.fitness.values)
+
+    return pareto_front_2
+
+# Função de Limpeza da População
+def clean_population(pop):
+    cleaned_population = []
+    for ind in pop:
+        if ind.fitness.valid and not any(np.isnan(x) for x in ind.fitness.values):
+            cleaned_population.append(ind)
+        else:
+            print(f"Indivíduo descartado devido a fitness inválido: {ind}")
+    return cleaned_population
+
+
+# Esta função é chamada após cada geração durante o processo de algoritmo genético. Tem como objetivo registrar informações relevantes após a conclusão de cada geração, 
+# como o número da geração atual e a melhor aptidão (fitness) encontrada na população. 
+def after_generation_callback(pop, generation): 
+    # Registra o número de geração e a melhor aptidão (fitness) na população
+    best_fitness = min(ind.fitness.values for ind in pop)
+    logging.info(f"Geração {generation}: Melhor Fitness - {best_fitness}")
+
+def execute_query(cursor, query, params=None):
+    cursor.execute(query, params)
+    # Consumi todos os resultados da consulta
+    result = cursor.fetchall()
+    return result
+
+def save_offspring_coordinates_to_db(ind, pool, individual_id, generation):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+
+        # Recupera o maior número de simulação atual
+        query = "SELECT MAX(simulacao) FROM `sensors`.tb_offspring_coordinates"
+        cursor.execute(query)
+        max_simulacao_result = cursor.fetchone()
+        max_simulacao = max_simulacao_result[0] or 0  # Assume 0 se não houver registros
+
+        # Define o novo número de simulação
+        new_simulacao = max_simulacao + 1
+
+        # Inseri as coordenadas na tabela `tb_offspring_coordinates`
+        insert_query = """
+        INSERT INTO `sensors`.tb_offspring_coordinates 
+        (coordenada_x, coordenada_y, simulacao, individual_id, generation)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+
+        # Cada indivíduo contém 12 valores (6 pares de coordenadas x, y)
+        for i in range(0, len(ind), 2):
+            coordenada_x = ind[i]
+            coordenada_y = ind[i + 1]
+            # Convert NumPy types to native Python types before insertion
+            coordenada_x_native = coordenada_x.item() if isinstance(coordenada_x, np.generic) else coordenada_x
+            coordenada_y_native = coordenada_y.item() if isinstance(coordenada_y, np.generic) else coordenada_y
+
+            # Inseri coordenadas com o número de simulação incrementado
+            cursor.execute(insert_query, (coordenada_x_native, coordenada_y_native, new_simulacao, individual_id, generation))
+
+        conn.commit()                
+        print(f"Coordenadas do indivíduo {individual_id} inseridas com o número de simulação: {new_simulacao}, geração: {generation}")
+    except mysql.connector.Error as e:
+        print(f"Primeiro Erro ao conectar ao MySQL: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# Esta função atualiza o arquivo XML remoto com dados de coordenadas recentemente obtidas do banco de dados. 
+# O processo é dividido em duas partes principais: recuperar dados do banco de dados e atualizar o arquivo remoto via SSH.
+def update_xml_with_db_data(ssh_credentials, db_config):
+    try:
+        # Conecta ao banco de dados e recupera as últimas 6 entradas
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT coordenada_x, coordenada_y FROM sensors.tb_devices ORDER BY id_device DESC LIMIT 6")
+        data = cursor.fetchall()
+        data.reverse()  # Ordem crescente pelo id_device
+        print("Conexão mysql efetuada com sucesso.")
+        
+    except mysql.connector.Error as e:
+        print(f"Erro de conexão com o banco de dados: {e}")
+        return
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(**ssh_credentials)
+        print("Conexão SSH efetuada com sucesso.")
+
+        sftp = ssh.open_sftp()        
+        remote_file_path = '/home/.../.../.../cenario_6x6_15min.csc'        
+        try:
+            with sftp.open(remote_file_path, 'r') as remote_file:
+                lines = remote_file.readlines()
+            print("Arquivo .CSC lido com sucesso! Preparando para atualizar...")
+        except IOError:
+            print("Arquivo .CSC não encontrado!!")
+            return  # Encerra a execução da função caso o arquivo não seja encontrado            
+                             
+        line_numbers_x = [123, 144, 165, 186, 207, 228]  # A contagem começa em 1
+        line_numbers_y = [124, 145, 166, 187, 208, 229]  # A contagem começa em 1
+        for index, (coordenada_x, coordenada_y) in enumerate(data):
+            if index < len(line_numbers_x):
+                lines[line_numbers_x[index] - 1] = f"        <x>{coordenada_x}</x>\n"  # Ajuste na formatação se necessário
+                lines[line_numbers_y[index] - 1] = f"        <y>{coordenada_y}</y>\n"
+
+        print("Iniciando a escrita no arquivo .CSC...")
+                
+        # Escrever as linhas atualizadas de volta no arquivo via SFTP
+        with sftp.open(remote_file_path, 'w') as remote_file:
+            remote_file.writelines(lines)
+        
+        # Após a escrita 
+        print("Arquivo .CSC atualizado com sucesso!")
+    except Exception as e:
+        print(f"Erro ao conectar via SSH ou ao manipular o arquivo: {e}")
+    finally:
+        if 'ssh' in locals():
+            ssh.close()
+            
+# Função pra salvar os logs no banco de dados    
+# Usando Conexões do Pool
+def save_logs_to_db(pool, id_individuo, individuo, num_tentativas, generation):
+    try:
+        conn = pool.get_connection()  # Obtém uma conexão do pool
+        cursor = conn.cursor()
+        
+        insert_query = """
+        INSERT INTO tb_logs (id_individuo, individuo, num_tentativas, generation)
+        VALUES (%s, %s, %s, %s)
+        """
+        individuo_str = ', '.join(map(str, individuo))
+        
+        cursor.execute(insert_query, (id_individuo, individuo_str, num_tentativas, generation))
+        conn.commit()
+        
+        print(f"Logs salvos com sucesso para o indivíduo {id_individuo}.")
+        
+    except Error as e:
+        print(f"Erro ao inserir dados no MySQL: {e}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+            
+# reinicia a máquina via ssh
+def restart_remote_machine(ssh_credentials):
+    hostname = ssh_credentials.get('hostname')
+    port = int(ssh_credentials.get('port'))  # Converte a porta para inteiro
+    username = ssh_credentials.get('username')
+    password = ssh_credentials.get('password')
+    
+    try:
+        # Cria um cliente SSH
+        client = paramiko.SSHClient()
+        
+        # Carrega as chaves do sistema local conhecidas
+        client.load_system_host_keys()
+        
+        # Adiciona a chave do servidor remoto automaticamente se ausente
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Conecta ao servidor remoto
+        client.connect(hostname, port=port, username=username, password=password)
+        
+        # Executa o comando de reinicialização
+        stdin, stdout, stderr = client.exec_command('sudo reboot')
+
+        # Espera pela conclusão do comando e captura a saída
+        stdout.channel.recv_exit_status()
+        output = stdout.read().decode()
+        error = stderr.read().decode()
+        
+        if output:
+            print(f"Output: {output}")
+        if error:
+            print(f"Error: {error}")
+        
+        print(f"A máquina remota {hostname} está reiniciando...")
+        
+    except paramiko.SSHException as e:
+        print(f"Erro de conexão SSH: {e}")
+    except Exception as e:
+        print(f"Erro: {e}")
+    finally:
+        client.close()
+        
+# Função que utiliza a biblioteca 'paramiko' para estabelecer uma conexão SSH (Secure Shell) com um servidor remoto e executar um comando de script usando 'sudo'.
+def execute_remote_script_with_sudo(ssh_credentials, script_path):
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(**ssh_credentials)
+        print("Conexão SSH efetuada com sucesso.")
+        
+        # Comando para executar o script com sudo
+        command = f'sudo sh {script_path}'
+        
+        # Executar o comando via SSH
+        stdin, stdout, stderr = ssh.exec_command(command)
+        
+        # Captura da senha do sudo (se necessária)
+        if ssh_credentials.get('password'):
+            stdin.write(ssh_credentials['password'] + '\n')
+            stdin.flush()
+
+        # Ler e exibir a saída do comando em tempo real
+        print("Saída do comando:")
+        while True:
+            line = stdout.readline()
+            if not line:
+                break
+            print(line.strip())
+        
+        # Verificar se houve erros
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            error_output = stderr.read().decode('utf-8')
+            print(f"Erro ao executar o comando: {error_output}")
+        else:
+            print("Comando executado com sucesso.")
+    except Exception as e:
+        print(f"Erro ao conectar via SSH: {e}")
+    finally:
+        if 'ssh' in locals():
+            ssh.close()
+
+def save_pareto_front_to_db(pareto_front, db_config, generation):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(buffered=True)
+
+        # Busca o último valor de 'simulacao' usado em 'tb_devices'.
+        cursor.execute("SELECT MAX(simulacao) FROM `sensors`.tb_devices")
+        last_simulacao = cursor.fetchone()[0]
+
+        if last_simulacao is None:
+            last_simulacao = 0  # Assume zero se não houver registros
+
+        # Converte cada indivíduo na frente de Pareto em uma lista e serializa para JSON.
+        pareto_front_lists = [[float(val) for val in ind] for ind in pareto_front]
+        pareto_front_str = json.dumps(pareto_front_lists)
+
+        # Serializa os valores de fitness para JSON
+        fitness_values_lists = [[float(val) for val in ind.fitness.values] for ind in pareto_front]
+        fitness_values_str = json.dumps(fitness_values_lists)
+
+        # Calcula o fitness global (soma dos fitnesses individuais de cada par de coordenadas)
+        fitness_global_list = [round(sum(ind.fitness.values), 4) for ind in pareto_front]
+        fitness_global_str = json.dumps(fitness_global_list)
+
+        # Insere a frente de Pareto com o valor de 'simulacao' correspondente.
+        insert_query = """
+        INSERT INTO `sensors`.tb_pareto_front (pareto_front, fitness, fitness_global, simulacao, generation)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (pareto_front_str, fitness_values_str, fitness_global_str, last_simulacao, generation))
+        conn.commit()
+        print("Frente de Pareto salva com sucesso.")
+
+        # Busca todas as frentes de Pareto do banco de dados para processamento posterior.
+        cursor.execute("SELECT fitness FROM `sensors`.tb_pareto_front")
+        rows = cursor.fetchall()
+
+        # Converte os dados obtidos em uma lista de frentes de Pareto.
+        pareto_fronts = [json.loads(row[0]) for row in rows]
+
+        # Converte a lista de frentes de Pareto em um DataFrame.
+        df_pareto_front = pd.DataFrame(pareto_fronts)
+
+        return df_pareto_front
+
+    except Error as e:
+        print(f"Erro ao inserir Pareto front no MySQL: {e}")
+        return pd.DataFrame()  # Retorna um DataFrame vazio em caso de erro.
+    finally:
+        # Fecha a conexão com o BD.
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# Esta função salva retorna uma lista de listas, onde cada sublista contém indivíduos de diferentes níveis de frentes de Pareto no banco de dados MySQL 
+# e em seguida efetua uma busca sobre todas as frentes de Pareto salvas para processamento posterior. 
+def save_pareto_front_to_db_2(pareto_front_2, db_config, generation):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(buffered=True)
+
+        # Obtenha o último valor 'simulacao' usado em 'tb_devices'.
+        cursor.execute("SELECT MAX(simulacao) FROM `sensors`.tb_devices")
+        last_simulacao = cursor.fetchone()[0]
+        if last_simulacao is None:
+            last_simulacao = 0  # Assuma zero se não houver registros
+
+        # Inicializa a lista para conter todas as entradas da fronteira de Pareto após a conversão.
+        pareto_front_lists = []
+        
+        # Converta cada indivíduo na frente de Pareto em uma lista e serialize para JSON.
+        for ind in pareto_front_2:
+            if isinstance(ind, list):
+                # Supondo que ind seja uma lista de valores numéricos (cenário padrão no DEAP)
+                inner_list = [float(val) for sublist in ind for val in sublist] if isinstance(ind[0], list) else [float(val) for val in ind]
+                pareto_front_lists.append(inner_list)
+            else:                
+                inner_list = [float(val) for sublist in list(ind) for val in sublist] if isinstance(list(ind)[0], list) else [float(val) for val in list(ind)]
+                pareto_front_lists.append(inner_list)
+
+        pareto_front_str = json.dumps(pareto_front_lists)
+
+        # Insira a frente de Pareto com o valor 'simulacao' correspondente.
+        insert_query = """        
+        INSERT INTO `sensors`.tb_pareto_front_2 (pareto_front_2, simulacao, generation)
+        VALUES (%s, %s, %s)
+        """
+        cursor.execute(insert_query, (pareto_front_str, last_simulacao, generation))
+        conn.commit()
+        print("-" * 60)
+        print("Todas as frentes de Pareto foram salvas com sucesso.")
+        
+        # Busca todas as frentes de Pareto do banco de dados para processamento posterior.
+        cursor.execute("SELECT pareto_front_2 FROM `sensors`.tb_pareto_front_2")
+        rows = cursor.fetchall()
+
+        # Converte os dados obtidos em uma lista de frentes de Pareto.
+        pareto_fronts = [json.loads(row[0]) for row in rows]
+
+        # Converte a lista de frentes de Pareto em um DataFrame.
+        df_pareto_front_2 = pd.DataFrame(pareto_fronts)
+
+        return df_pareto_front_2
+
+    except Error as e:
+        print(f"Erro ao inserir Pareto front no MySQL: {e}")
+        return pd.DataFrame()  # Retorna um DataFrame vazio em caso de erro.
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+                        
+def display_last_6_entries_from_tb_devices(pool, last_processed_individual_id):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+
+        # Consulta SQL para buscar os últimos 6 registros referentes ao individual_id passado
+        query = """
+        SELECT individual_id, coordenada_x, coordenada_y, id_offspring_coordinates
+        FROM `sensors`.tb_offspring_coordinates
+        WHERE individual_id = %s
+        ORDER BY id_offspring_coordinates DESC
+        LIMIT 6
+        """
+        cursor.execute(query, (last_processed_individual_id,))  # Note a vírgula para garantir que seja uma tupla
+        rows = cursor.fetchall()
+
+        # Converte os resultados em um DataFrame
+        df = pd.DataFrame(rows, columns=['individual_id', 'coordenada_x', 'coordenada_y', 'id_offspring_coordinates'])
+
+        # Exibe as informações
+        print(f"\nÚltimo indivíduo processado e salvo na tabela 'tb_offspring_coordinates': Individual ID: {last_processed_individual_id}")
+        for _, row in df.iterrows():
+            print(f"  ID Offspring Coordinates: {row['id_offspring_coordinates']}, Coordenada X: {row['coordenada_x']}, Coordenada Y: {row['coordenada_y']}")
+
+    except mysql.connector.Error as e:
+        print(f"Erro ao conectar ao MySQL: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# Calcula a distância euclidiana entre dois indivíduos usando NumPy, arredondando o resultado para 2 casas decimais.
+def calculate_distance_np(ind1, ind2):
+    coord1 = np.array(ind1)
+    coord2 = np.array(ind2)
+    distance = np.linalg.norm(coord1 - coord2)
+    return round(distance, 2)
+
+# Função que mantém o controle dos filhos de cada nó
+def find_closest_parent(ind, candidates, children_map, max_children, sink):
+    closest_parent = None
+    min_distance = float('inf')
+    for candidate in candidates:
+        candidate_tuple = tuple(candidate)
+        max_children_allowed = 3 if candidate == sink else max_children
+        if len(children_map[candidate_tuple]) < max_children_allowed:
+            distance = calculate_distance_np(ind, candidate)
+            if distance < min_distance:
+                closest_parent = candidate
+                min_distance = distance
+    return closest_parent, min_distance
+
+# Função modificada para impor a regra de no máximo 2 filhos por nó (exceto o sink) e retornar o mapeamento dos pais para filhos.
+def simulate_organize_into_dodag(offspring, max_children=2):
+    sink = [62.84, 1.66]
+    remaining_nodes = [coord for ind in offspring for coord in zip(ind[::2], ind[1::2])]
+    processed_nodes = [sink]
+    children_map = {tuple(sink): []}
+    total_attempts = 0
+
+    for ind in remaining_nodes:
+        closest_parent, min_distance = find_closest_parent(ind, processed_nodes, children_map, max_children, sink)
+        total_attempts += 1
+        if closest_parent and min_distance <= MAX_DISTANCE:
+            processed_nodes.append(ind)
+            children_map[tuple(ind)] = []
+            children_map[tuple(closest_parent)].append(ind)
+        else:
+            return False, total_attempts, children_map
+    return True, total_attempts, children_map
+
+# Função para imprimir o DODAG
+def print_dodag(children_map):
+    for parent, children in children_map.items():
+        if not children:
+            print(f"Parent {parent} has children 0")
+        else:
+            print(f"Parent {parent} has children {children}")
+            
+def save_dodag_to_db(pool, generation, simulacao, individual_id, children_map):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+
+        # Inserir dados na tabela tb_individuo_dodag
+        insert_individuo_query = """
+        INSERT INTO `sensors`.tb_individuo_dodag (individuo, simulacao, generation)
+        VALUES (%s, %s, %s)
+        """
+        cursor.execute(insert_individuo_query, (individual_id, simulacao, generation))
+        id_individuo_dodag = cursor.lastrowid         
+                
+        # Inserir dados na tabela tb_dodag
+        insert_dodag_query = """
+        INSERT INTO `sensors`.tb_dodag (id_individuo_dodag, parent, children)
+        VALUES (%s, %s, %s)
+        """
+        for parent, children in children_map.items():
+            parent_str = json.dumps(parent)
+            children_str = json.dumps(children)
+            cursor.execute(insert_dodag_query, (id_individuo_dodag, parent_str, children_str))
+
+        conn.commit()
+        print(f"DODAG do indivíduo {individual_id} salvo com sucesso no banco de dados.")
+
+    except mysql.connector.Error as e:
+        print(f"Erro ao conectar ao MySQL: {e}")
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conn' in locals() and conn.is_connected():
+            conn.close()
+
+def get_simulacao_number(pool):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+
+        # Recupera o maior número de simulação atual
+        query = "SELECT MAX(simulacao) FROM `sensors`.tb_devices"
+        cursor.execute(query)
+        max_simulacao_result = cursor.fetchone()
+        max_simulacao = max_simulacao_result[0] or 0  # Assume 0 se não houver registros
+
+        return max_simulacao + 1
+
+    except mysql.connector.Error as e:
+        print(f"Erro ao conectar ao MySQL: {e}")
+        return None
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conn' in locals() and conn.is_connected():
+            conn.close()
+
+def obter_10_individuos_do_bd(pool):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+
+        # Seleciona os últimos 60 dispositivos e suas métricas
+        query_data = """
+            SELECT id_offspring_coordinates, coordenada_x, coordenada_y, energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s 
+            FROM (
+                SELECT id_offspring_coordinates, coordenada_x, coordenada_y, energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s 
+                FROM `sensors`.tb_offspring_coordinates 
+                ORDER BY id_offspring_coordinates DESC 
+                LIMIT 60
+            ) subquery 
+            ORDER BY id_offspring_coordinates ASC
+        """
+        cursor.execute(query_data)
+        data_bd = cursor.fetchall()
+
+        if not data_bd:
+            print("Nenhum dado encontrado no banco de dados.")
+            return []
+
+        # Cria um dicionário para acessar as métricas por coordenadas
+        data_dict = {(coord_x, coord_y): (id_bd, energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s) for id_bd, coord_x, coord_y, energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s in data_bd}
+
+        individuos = []
+        # Agrupa os dados em 10 indivíduos, cada um com 6 pares de coordenadas
+        for i in range(0, len(data_bd), 6):
+            if i + 6 > len(data_bd):  # Verifica se há pares suficientes para formar um indivíduo
+                break
+            fitness_values = [0.0] * 6  # Inicializa os valores de fitness para 6 métricas
+            coords = []
+            id_bd = None
+            valid_ind = True
+            for j in range(6):
+                row = data_bd[i + j]
+                coord_x, coord_y = row[1], row[2]
+                coords.extend([coord_x, coord_y])
+                if (coord_x, coord_y) in data_dict:
+                    id_bd, energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s = data_dict[(coord_x, coord_y)]
+                    metrics = [energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s]
+                    fitness_values = [round(sum(x), 4) for x in zip(fitness_values, metrics)]
+                else:
+                    valid_ind = False
+                    break
+            if valid_ind and len(fitness_values) == 6:
+                individuo = {
+                    'id': id_bd,
+                    'coords': coords,
+                    'fitness': fitness_values
+                }
+                individuos.append(individuo)
+
+        return individuos[:10]  # Retorna apenas os 10 primeiros indivíduos completos
+
+    except mysql.connector.Error as e:
+        print(f"Erro ao conectar ao MySQL: {e}")
+        return []
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+# Definir a Função de Distância
+def euclidean_distance(ind1, ind2):
+    return np.linalg.norm(np.array(ind1) - np.array(ind2))
+
+# Função de Compartilhamento
+def sharing_function(distance, sigma_share, alpha=1.5):
+    if distance < sigma_share:
+        return 1.5 - (distance / sigma_share) ** alpha
+    else:
+        return 0.0
+
+# Aplica o compartilhamento de Fitness
+def apply_fitness_sharing(pop, sigma_share, alpha=1.5):
+    for ind1 in pop:
+        shared_fitness = 0.0
+        for ind2 in pop:
+            if ind1 != ind2:
+                distance = euclidean_distance(ind1, ind2)
+                shared_fitness += sharing_function(distance, sigma_share, alpha)
+
+        # Ajuste o fitness do indivíduo com o compartilhamento
+        ind1.fitness.values = tuple(f / (1 + shared_fitness) for f in ind1.fitness.values)
+
+    return pop
+    
+# Função de cálculo de diversidade
+def calculate_population_diversity(pop):
+    if len(pop) < 2:
+        return 0.0
+
+    # Converte os fitnesses dos indivíduos em uma matriz de pontos
+    points = np.array([ind.fitness.values for ind in pop])
+
+    # Calcula a matriz de distâncias entre os indivíduos
+    distances = np.sqrt(np.sum((points[:, np.newaxis] - points[np.newaxis, :])**2, axis=2))
+
+    # Apenas consideramos a metade da matriz (sem diagonais), pois as distâncias são simétricas
+    diversity = np.sum(distances) / (len(pop) * (len(pop) - 1))
+    
+    return diversity
+
+def setup_toolbox(problem, ref_points, eta, eta2, indpb, cxpb, mutpb):
+    toolbox = base.Toolbox()        
+    toolbox.register("individual", create_individual, data_row=None)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)    
+    toolbox.register("evaluate", problem.evaluate_objective)
+    toolbox.register("mate", custom_cxSimulatedBinaryBounded, eta=eta, low=XL, up=XU)        
+    toolbox.register("mutate", custom_mutPolynomialBounded, eta2=eta2, low=XL, up=XU, indpb=indpb)
+    toolbox.register("select", tools.selNSGA3, ref_points=ref_points)
+    return toolbox
+
+def run_genetic_algorithm(toolbox, problem_instance, ref_points, cxpb, mutpb, db_config, pool, eta, eta2, indpb, NGEN=1, start_gen=0):
+    # Parâmetros AG
+    eta, eta2, indpb, cxpb, mutpb = 5, 5, 0.6, 0.85, 0.6
+    
+    global all_generations, pop
+
+    record = {"gen": 0, "evals": 0, "std": 0, "min": float("inf"), "avg": float("inf"), "max": 0}
+
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean, axis=0)
+    stats.register("std", np.std, axis=0)
+    stats.register("min", np.min, axis=0)
+    stats.register("max", np.max, axis=0)
+
+    logbook = tools.Logbook()
+    logbook.header = ["gen", "evals", "std", "min", "avg", "max"]
+
+    pop = problem_instance.get_initial_pop()    
+    
+    for ind in pop:
+        if len(ind.fitness.values) != 6 or any(abs(f) < 1e-6 for f in ind.fitness.values) or ind.fitness.values == (0.0, 0.0, 0.0, -0.0, 0.0, -0.0):
+            ind.fitness.values = tuple([19.162, 25.8012, 2757.2, 0.12, 10.232, 0.12])  # Corrige para 6 valores            
+
+    # Avaliar os indivíduos com aptidão inválida
+    invalid_ind = [ind for ind in pop if not ind.fitness.valid]
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    for ind, fit in zip(invalid_ind, fitnesses):
+        ind.fitness.values = tuple(fit)   
+    print("População inicial avaliada!") 
+
+    # Aplica o Fitness Sharing para promover a diversidade
+    sigma_share = 0.4  # Ajuste este valor conforme necessário
+    apply_fitness_sharing(pop, sigma_share, alpha=1.5)
+        
+    # Mensagem para Depuração
+    print("-" * 60)
+    print("População inicial importada e válida:")
+    print("-" * 60)
+    for idx, ind in enumerate(pop):
+        print(f"Indivíduo {idx + 1}: {ind}")
+        print(f"    Vetor Fitness: {ind.fitness.values}")
+    print("-" * 60)
+    
+    all_generations = []
+    pareto_front = None
+    pareto_front_2 = None    
+    
+    toolbox = setup_toolbox(problem_instance, ref_points, eta, eta2, indpb, cxpb, mutpb)
+    
+    # Carrega o ponto de referência salvo do banco de dados
+    ref_point, ref_simulacao, ref_generation = load_reference_point_from_db(pool)
+
+    if ref_point is None:
+        # Calcula o ponto de referência fixo se não estiver salvo
+        pareto_front = identify_pareto_front(pop)
+        maximize_indices = [3, 5]  # Índices de total_data_volume_kb e transfer_rate_kb_s
+        ref_point = get_fixed_reference_point(pareto_front, maximize_indices, margin=1.0)
+        # Obter o número de simulação atual
+        ref_simulacao = get_simulacao_number(pool)
+        # Salva o ponto de referência no banco de dados
+        save_reference_point_to_db(ref_point, pool, ref_simulacao, start_gen)
+
+    while True:
+        for gen in range(start_gen, start_gen + NGEN):
+            print("-" * 60)
+            print(f"Processando geração {gen}...")
+
+            pop = clean_population(pop)
+
+            MAX_TOTAL_ATTEMPTS = 10
+            MAX_REGEN_ATTEMPTS = 2 # Para indivíduos inválidos, tenta regenerar até um máximo definido.
+
+            successful_inds = []
+            selected_inds_for_processing = []
+
+            offspring = algorithms.varAnd(pop, toolbox, cxpb=cxpb, mutpb=mutpb)
+            print(f"Total de indivíduos gerados por meio de cruzamento e mutação: {len(offspring)}")
+
+            # Mensagem para DEPURAÇÃO dos indivíduos gerados por mutação e cruzamento
+            print("-" * 60)
+            print("Indivíduos gerados por mutação e cruzamento:")
+            print("-" * 60)
+            for idx, ind in enumerate(offspring):
+                print(f"Indivíduo {idx + 1}: {ind}")
+
+            failed_individuals = offspring[:]
+            successful_individuals = 0
+            total_attempts = 0     
+          
+            while failed_individuals and total_attempts < MAX_TOTAL_ATTEMPTS and successful_individuals < 10:                     
+                next_failed_individuals = []
+
+                for count, ind in enumerate(failed_individuals, start=0):
+                    print("-" * 60)
+                    print(f"Processando indivíduo {count}/{len(failed_individuals)}: {ind}")
+                    print("-" * 60)
+                    attempts = 0
+                    dodag_success = False
+
+                    while not dodag_success and attempts < MAX_REGEN_ATTEMPTS + 1:
+                        valid = True
+                        for j in range(0, len(ind), 2):
+                            if coordinates_exist(ind[j], ind[j + 1]) or ind[j] == 0.0 or ind[j + 1] == 0.0:
+                                valid = False
+                                break
+                        
+                        if not valid:
+                            if attempts % 2 == 0:
+                                # Opção 1
+                                new_offspring = custom_varAnd([ind], toolbox, cxpb=cxpb, mutpb=mutpb)
+                                new_ind = new_offspring[0] if new_offspring else None                                
+                                print("Opção 1")
+                            else:
+                                # Opção 2
+                                new_ind = regenerate_individual(toolbox)
+                                print("Opção 2")
+
+                            if new_ind:
+                                ind = new_ind
+                                print(f"Tentativa de regeneração {attempts + 1}: Indivíduo regenerado - {ind}")                                
+                            attempts += 1
+                            if not new_ind:  # Verifica se a regeneração falhou após várias tentativas
+                                print(f"Falha na regeneração do indivíduo {count}. Pulando para o próximo.")
+                                break
+                            continue                   
+
+                        dodag_success, _, children_map = simulate_organize_into_dodag([ind], max_children=3)                        
+                        if dodag_success:                            
+                            print(f"DODAG simulado com sucesso localmente para o indivíduo {count}!")
+                            csv_filename = os.path.join(base_path, f"dodag_generation_{gen}_ind_{count}.csv")
+                            save_dodag_to_csv(children_map, csv_filename)
+                            print(f"DODAG salvo com sucesso em {csv_filename}.")
+                            print_dodag(children_map)                                                         
+                            
+                            successful_individuals += 1   
+                            # Adicionar o indivíduo processado com sucesso na lista
+                            selected_inds_for_processing.append(ind)
+                            successful_inds.append(ind)                                                          
+                            
+                            # Salvar no banco de dados apenas se menos de 10 indivíduos foram salvos
+                            if len(successful_inds) <= 10:  
+                                new_simulacao = get_simulacao_number(pool)
+                                save_dodag_to_db(pool, gen, new_simulacao, count, children_map)
+                                                        
+                            # Quebra o loop se atingiu o limite de 10 indivíduos bem-sucedidos
+                            if successful_individuals == 10:
+                                break
+
+                        attempts += 1
+                        
+                    if attempts == MAX_REGEN_ATTEMPTS + 1:
+                        logging.warning(f"Máximo de tentativas de regeneração alcançadas para o indivíduo {count}. Tentativa {attempts}. Tentativa final: {ind}")
+                        next_failed_individuals.append(ind)
+                        # Salvar os dados no banco de dados para o indivíduo falho
+                        save_logs_to_db(pool, count, ind, attempts, gen)
+                        print("Teste BD 0!")
+                        
+                    else:
+                        total_attempts += 1
+                        
+                if successful_individuals == 10:
+                    break  # Interrompe o loop externo se 10 indivíduos bem-sucedidos foram atingidos
+
+                failed_individuals = next_failed_individuals
+
+                if total_attempts >= MAX_TOTAL_ATTEMPTS:
+                    print("-" * 60)
+                    logging.warning("Máximo de tentativas gerais alcançadas. Interrompendo o processo.")
+                    break
+
+            print(f"Total de indivíduos que foram processados com sucesso para formar o DODAG: {successful_individuals}")            
+            
+            if successful_individuals == 10 or not failed_individuals:
+                print("Processamento da geração completado ou interrompido.")                                           
+        
+            # Verifica se há indivíduos processados com sucesso
+            if selected_inds_for_processing:
+                print("-" * 60)
+                print("Indivíduos selecionados para processamento adicional:")
+                print("-" * 60)
+                for idx, ind in enumerate(selected_inds_for_processing[:10], start=1):
+                    print(f"Indivíduo {idx}: {ind}")                                                
+                
+                # Executa as funções específicas apenas para os 10 indivíduos selecionados
+                for count, ind in enumerate(selected_inds_for_processing[:10], start=1):
+                    try:
+                        save_offspring_coordinates_to_db(ind, pool, count, gen) 
+                        print("DODAG organizado com sucesso e atualizado no banco de dados.")                        
+
+                        # Atualiza o arquivo XML do Contiki-NG
+                        update_xml_with_db_data(ssh_credentials, db_config)
+                        
+                        # Inicia o processo de Simulação e demais scripts shell
+                        execute_remote_script_with_sudo(ssh_credentials, script_path)
+                        
+                        # O 'last_processed_individual_id' é o ID do indivíduo que acabou de ser processado com sucesso
+                        last_processed_individual_id = count  
+                        display_last_6_entries_from_tb_devices(pool, last_processed_individual_id)                                                 
+                                
+                        # Reinicia a máquina remota com o Contiki-NG
+                        print("Reiniciando a máquina remota com o Contiki-NG...")
+                        restart_remote_machine(ssh_credentials)
+                        
+                        # Inserção das métricas para o último indivíduo salvo                                        
+                        print("Inserindo as métricas do indivíduo simulado no banco de dados...")
+                        insert_metrics_to_db(pool)                          
+
+                    except mysql.connector.Error as e:
+                        print(f"Erro ao conectar ao MySQL: {e}")
+                    except Exception as e:
+                        print(f"Erro ao atualizar DODAG no banco de dados: {e}")
+
+                # Use a função para redefinir os indivíduos bem-sucedidos
+                successful_inds_data = obter_10_individuos_do_bd(pool)
+
+                # Atualiza o successful_inds com os indivíduos do banco de dados
+                successful_inds = []
+                for ind_data in successful_inds_data:
+                    ind = creator.Individual(ind_data['coords'])
+                    ind.id = ind_data['id']
+                    ind.fitness.values = tuple(ind_data['fitness'])
+                    successful_inds.append(ind)                
+
+                # Limite o tamanho do successful_inds a 10, caso tenha mais
+                successful_inds = successful_inds[:10]
+                print("Verificando dados do successful_inds!!!")
+                print(successful_inds)
+                print("-" * 60)
+
+                # Imprime os indivíduos e seus respectivos valores de fitness após a atualização
+                for ind in successful_inds:
+                    if len(ind.fitness.values) == 6:
+                        print(f"Indivíduo atualizado: {ind}")
+                        print(f"    Fitness: {ind.fitness.values}")
+                    else:
+                        print(f"Erro ao atualizar o fitness do indivíduo: {ind.fitness.values}")
+                        
+                # Avalia os indivíduos com fitness inválido (DEAP)
+                invalid_ind = [ind for ind in successful_inds if not ind.fitness.valid]
+                fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+                for ind, fit in zip(invalid_ind, fitnesses):
+                    ind.fitness.values = tuple(fit)                
+
+                # Mensagem para DEPURAÇÃO
+                print("-" * 60)
+                print("Avaliando indivíduos com fitness inválido...")                
+                for idx, ind in enumerate(invalid_ind, start=1):
+                    print(f"Indivíduo {idx}: {ind}, Fitness: {ind.fitness.values}")
+                print("-" * 60)            
+                
+                # Mensagem para DEPURAÇÃO
+                # Armazena a fitness dos indivíduos processados com sucesso para a geração atual
+                successful_gen_fitness = np.array([ind.fitness.values for ind in successful_inds])
+                df_successful_gen = pd.DataFrame(successful_gen_fitness, columns=[f'Objective {i+1}' for i in range(successful_gen_fitness.shape[1])])
+                df_successful_gen['Source'] = f'Generation {gen} - Successful'
+                all_generations.append(df_successful_gen)
+                print(f"Geração {gen}: Indivíduos Processados com Sucesso:")
+                for idx, ind in enumerate(successful_inds, start=1):
+                    print(f"Indivíduo {idx}: {ind}")
+                    print(f"    Fitness: {ind.fitness.values}")                             
+                
+                # Verificação de valores de fitness inválidos na população atual e na população combinada
+                def validar_e_corrigir_fitness(populacao):
+                    for idx, ind in enumerate(populacao, start=1):                        
+                        if len(ind.fitness.values) != 6 or any(abs(f) < 1e-6 for f in ind.fitness.values) or ind.fitness.values == (0.0, 0.0, 0.0, -0.0, 0.0, -0.0):
+                            ind.fitness.values = tuple([19.163, 25.8013, 2757.3, 0.13, 10.233, 0.13])  # Corrige para 6 valores
+                            print(f"Indivíduo {idx}: {ind}")
+                            print(f"    Vetor Fitness: {ind.fitness.values}")
+
+                # Corrige fitness inválido na população atual
+                validar_e_corrigir_fitness(pop)
+                                
+                # Imprime a população atualizada
+                print("-" * 60) 
+                print("Após corrigir a pop")
+                for idx, ind in enumerate(pop):                
+                    print(f"Indivíduo {idx + 1}: {ind}")
+                    print(f"    Vetor Fitness: {ind.fitness.values}")
+                print("-" * 60) 
+                                
+                # Corrige fitness inválido nos indivíduos bem-sucedidos
+                validar_e_corrigir_fitness(successful_inds)
+                
+                # Imprime a successful_inds atualizada
+                print("Após corrigir o fitness inválido nos indivíduos bem-sucedidos")
+                for idx, ind in enumerate(successful_inds):                    
+                    print(f"Indivíduo {idx + 1}: {ind}")
+                    print(f"    Vetor Fitness: {ind.fitness.values}")
+                print("-" * 60) 
+                                                
+                # Combina a população atual com os novos indivíduos bem-sucedidos
+                combined_population = pop + successful_inds
+                print("-" * 60) 
+                print("Combina a população atual (21 indivíduos) + 10 indivíduos bem-sucedidos")
+                print("-" * 60) 
+                
+                # Certifique-se de que todos os indivíduos na população combinada tenham valores de fitness válidos
+                validar_e_corrigir_fitness(combined_population)
+
+                # Verifica se o tamanho da população combinada está correto
+                if len(combined_population) == 31:
+                    print("Tamanho da população combinada: 31")
+                    print("-" * 60) 
+                else:
+                    print(f"Erro: Tamanho da população combinada incorreto. Esperado 31, obtido {len(combined_population)}")                 
+
+                # Imprime a população combinada e seus respectivos valores de fitness
+                for idx, ind in enumerate(combined_population):
+                    print(f"Indivíduo {idx + 1}: {ind}")
+                    print(f"    Vetor Fitness: {ind.fitness.values}")
+                print("-" * 60)  
+
+                # Inserir o cálculo da Crowding Distance aqui
+                tools.emo.assignCrowdingDist(combined_population)
+                
+                # Verifica se todos os indivíduos têm fitness válido e com o tamanho correto
+                print("Verifica se todos os indivíduos na população combinada têm valores de fitness válidos!")
+                def verificar_fitness(populacao):
+                    all_valid = True
+                    for idx, ind in enumerate(populacao):
+                        if not hasattr(ind.fitness, 'values') or len(ind.fitness.values) != 6:
+                            print(f"Indivíduo {idx + 1} com fitness inválido: {ind.fitness.values}")
+                            all_valid = False
+                        elif any(np.isnan(f) for f in ind.fitness.values):
+                            print(f"Indivíduo {idx + 1} com valores de fitness NaN: {ind.fitness.values}")
+                            all_valid = False
+                        elif any(abs(f) < 1e-6 for f in ind.fitness.values):
+                            print(f"Indivíduo {idx + 1} com valores de fitness muito pequenos: {ind.fitness.values}")
+                            all_valid = False
+                    if all_valid:
+                        print("Todos os indivíduos têm fitness válidos!")
+                    return all_valid                           
+           
+
+                if verificar_fitness(combined_population):
+                    print("Executando toolbox.select...")
+                    try:
+                        selected_pop = toolbox.select(combined_population, k=21)
+                        print("População atualizada com os 21 melhores indivíduos bem-sucedidos.")
+                        
+                        # Imprime a população selecionada e seus respectivos valores de fitness
+                        for idx, ind in enumerate(selected_pop):
+                            print(f"Indivíduo {idx + 1}: {ind}")
+                            print(f"    Vetor Fitness: {ind.fitness.values}")
+
+                        # Validar tamanho dos fitness values
+                        for ind in selected_pop:
+                            if len(ind.fitness.values) != 6:
+                                print(f"Erro: Indivíduo com tamanho de fitness inconsistente: {ind.fitness.values}")
+                    except Exception as e:
+                        print(f"Erro ao selecionar a população: {e}")
+                else:
+                    print("Corrija os valores de fitness inválidos antes de tentar selecionar a população novamente.")                        
+
+                # Atualiza a população
+                pop = selected_pop
+                
+                # Salva os 21 melhores indivíduos no banco de dados
+                save_best_21_individuals(pop, pool, gen)
+                                
+                # Compila as estatísticas sobre a nova população 
+                record = stats.compile(pop)
+                
+                # Calcula a diversidade da população
+                diversity = calculate_population_diversity(pop)                
+                
+                # Adiciona a diversidade ao registro do logbook
+                logbook.record(gen=gen, evals=len(invalid_ind), std=record['std'], min=record['min'], avg=record['avg'], max=record['max'], diversity=diversity)
+
+                # Exibe as informações da geração, incluindo a diversidade
+                print(f"Geração {gen} - Diversidade da população: {diversity}")
+                print(logbook.stream)
+
+            else:
+                print("Nenhum indivíduo processado com sucesso foi adicionado à população.")             
+            
+            # Esta função salva o estado atual de uma execução do algoritmo genético no banco de dados MySQL.       
+            save_state_to_db(pop, None, gen, db_config)            
+            
+            # Obtendo a frente de Pareto atual
+            # Usado também para determinar o Hipervolume
+            pareto_front = identify_pareto_front(pop)
+    
+            df_pareto_front = save_pareto_front_to_db(pareto_front, db_config, gen)              
+            print("Teste BD 6!")          
+            if isinstance(df_pareto_front, pd.DataFrame):
+                print("-" * 60)
+                print("Fronteira de Pareto:")
+                print("-" * 60)
+                print(df_pareto_front.to_string(index=False))
+            else:
+                print("Erro: O primeiro item retornado não é um DataFrame.")
+
+            pareto_front_2 = identify_pareto_front_2(pop)
+            df_pareto_front_2 = save_pareto_front_to_db_2(pareto_front_2, db_config, gen)
+            print("Teste BD 7!")
+            if isinstance(df_pareto_front_2, pd.DataFrame) and not df_pareto_front_2.empty:
+                print("-" * 60)
+                print("All Pareto Fronts:")
+                print("-" * 60)
+                print(df_pareto_front_2.to_string(index=False))
+            else:
+                print("Error: No valid DataFrame was returned, or DataFrame is empty.")
+
+            best_fitness = min(ind.fitness.values for ind in pareto_front)
+
+            all_generations.append(pop)
+            
+            # Calcula as métricas
+            maximize_indices = [3, 5]  # Índices de total_data_volume_kb e transfer_rate_kb_s
+            print("Calculando a distância geracional...")
+            gd = calculate_generational_distance(pop, pareto_front, maximize_indices)                                         
+            
+            # Calculando o hipervolume
+            print("Calculando o hipervolume...")
+            hypervolume = calculate_hypervolume(pareto_front, ref_point, maximize_indices)                       
+            
+            # Salva os resultados no banco de dados
+            save_grid_search_results(
+                pool, eta, eta2, indpb, cxpb, mutpb,
+                best_fitness, gd, hypervolume, gen
+            )            
+            
+        user_input = input("Deseja continuar a otimização para mais gerações? (y/n): ")
+        if user_input.lower() == 'y':
+            NGEN = int(input("Digite o número de novas gerações que deseja executar: "))
+            start_gen += NGEN
+            print("Continuando algoritmo de otimização...")
+        else:
+            print("Otimização pausada! Continue mais tarde.")
+            break
+
+    logging.info("O algoritmo foi encerrado com sucesso.")
+    print("-" * 60)
+    
+    return pop, best_fitness, all_generations, pareto_front, pareto_front_2, ref_points, logbook, df_pareto_front, gen 
+  
+
+def save_grid_search_results(pool, eta, eta2, indpb, cxpb, mutpb, best_fitness, gd, hypervolume, generation):
+    best_fitness_str = str(best_fitness)
+    conn = None
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT MAX(simulacao) FROM `sensors`.tb_devices")
+        last_simulacao = cursor.fetchone()[0] or 0
+
+        insert_query = """
+        INSERT INTO `sensors`.tb_grid_search_results
+        (eta, eta2, indpb, cxpb, mutpb, best_fitness_str, gd, hypervolume, simulacao, generation)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """                                    
+        cursor.execute(insert_query, (eta, eta2, indpb, cxpb, mutpb, best_fitness_str, gd, hypervolume, last_simulacao + 1, generation))
+        conn.commit()
+        print("Resultados da pesquisa em grade salvos com sucesso.")
+    except mysql.connector.Error as e:
+        print(f"Erro ao inserir no MySQL: {e}")
+    finally:
+        if conn:
+            cursor.close()
+            conn.close()
+
+def save_best_21_individuals(pop, pool, generation):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+
+        # Inicia uma transação
+        conn.start_transaction()
+
+        # Insere os novos registros
+        for individual_id, ind in enumerate(pop):
+            # Insere na tabela `tb_devices`
+            insert_devices_query = """
+            INSERT INTO `sensors`.tb_devices (coordenada_x, coordenada_y, processed, simulacao, individual_id, generation)
+            VALUES (%s, %s, FALSE, %s, %s, %s)
+            """
+            for i in range(0, len(ind), 2):
+                cursor.execute(insert_devices_query, (
+                    ind[i], ind[i + 1], generation, individual_id + 1, generation
+                ))
+
+            # Obtém o id_device gerado
+            cursor.execute("SELECT LAST_INSERT_ID()")
+            id_device = cursor.fetchone()[0]
+
+            # Insere na tabela `tb_metrics`
+            insert_metrics_query = """
+            INSERT INTO `sensors`.tb_metrics (id_device, energest_cpu_j, total_energy_consumption_j, latency_s, total_data_volume_kb, response_time_s, transfer_rate_kb_s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_metrics_query, (
+                id_device, *ind.fitness.values
+            ))
+
+        # Confirma a transação
+        conn.commit()
+        print("Indivíduos da nova geração salvos com sucesso.")
+
+    except mysql.connector.Error as e:
+        print(f"Erro ao salvar indivíduos no banco de dados: {e}")
+        conn.rollback()
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+# Esta função salva o estado atual de uma execução do algoritmo genético no banco de dados MySQL.
+def save_state_to_db(pop, pareto_front, gen, db_config):
+    conn = None
+    cursor = None
+
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(buffered=True)
+
+        # Busca o último valor de 'simulacao' usado em 'tb_devices'
+        cursor.execute("SELECT MAX(simulacao) FROM `sensors`.tb_devices")
+        last_simulacao = cursor.fetchone()[0]
+        if last_simulacao is None:
+            last_simulacao = 0  # Assume zero se não houver registros
+
+        # Insere novo estado com a geração atual e a última simulação encontrada
+        insert_query = """
+        INSERT INTO `sensors`.tb_state (type, individual, fitness, generation, simulacao)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+
+        # Prepara os dados para inserção
+        data_to_insert = []
+        for ind in pop:  # Supondo que 'pop' seja a população a ser salva
+            data_to_insert.append(('Population', str(list(ind)), str(list(ind.fitness.values)), gen, last_simulacao))
+        if pareto_front:  # Supondo que 'pareto_front' seja o front de Pareto a ser salvo
+            for ind in pareto_front:
+                data_to_insert.append(('ParetoFront', str(list(ind)), str(list(ind.fitness.values)), gen, last_simulacao))
+
+        # Executa a inserção
+        cursor.executemany(insert_query, data_to_insert)
+
+        # Confirma a transação
+        conn.commit()
+    except Error as e:
+        print(f"Erro ao salvar o estado no banco de dados: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+# Esta função carrega o estado salvo de uma execução anterior do algoritmo evolutivo.
+def load_state_from_db(connection):
+    cursor = connection.cursor()
+    cursor.execute("SELECT type, individual, fitness, generation FROM tb_state ORDER BY generation DESC LIMIT 1")
+    records = cursor.fetchall()
+    
+    # Inicializações
+    pop = []
+    pareto_front = []
+    generation = 0
+
+    # Verifica se há registros para carregar
+    if not records:
+        return pop, pareto_front, generation
+
+    # Assume que a última geração salva é a que queremos carregar
+    for record in records:
+        # Extrai os campos do registro
+        type_, individual_str, fitness_str, gen = record
+        generation = gen  # Atualiza a geração
+
+        # Converte strings de volta para os formatos adequados
+        individual_list = ast.literal_eval(individual_str)
+        fitness_list = ast.literal_eval(fitness_str)
+
+        # Cria um indivíduo com base na lista e define seu fitness
+        individual = creator.Individual(individual_list)
+        individual.fitness.values = tuple(fitness_list)
+
+        # Adiciona o indivíduo à população ou ao front de Pareto
+        if type_ == 'Population':
+            pop.append(individual)
+        elif type_ == 'ParetoFront':
+            pareto_front.append(individual)
+
+    return pop, pareto_front, generation
+
+# Esta função apaga todos os registros da tabela 'sensors.tb_state' no BD MySQL limpando o "estado" salvo.
+def clear_state_db(db_config):    
+    conn = None  # Inicializa a variável conn aqui para garantir que ela esteja no escopo correto
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("DELETE FROM `sensors`.tb_state")
+        conn.commit()
+        print("O estado salvo foi limpo com sucesso.")
+    except Error as e:
+        print(f"Erro ao tentar limpar o estado salvo: {e}")
+        if conn is not None and conn.is_connected():
+            conn.rollback()  # Faz rollback em caso de erro na operação de delete
+    finally:
+        if conn is not None and conn.is_connected():
+            conn.close()
+
+# Gera um novo indivíduo com 6 pares de coordenadas e utilizando pool
+def regenerate_individual(toolbox):
+    max_attempts = 10
+    attempts = 0
+    while attempts < max_attempts:
+        new_ind = toolbox.individual()  # Gera um novo indivíduo com 6 pares de coordenadas
+        # Arredonda cada valor do indivíduo para 2 casas decimais
+        new_ind = [round(value, 2) for value in new_ind]
+        
+        if not any(new_ind[i] == 0 or new_ind[i + 1] == 0 for i in range(0, len(new_ind), 2)):
+            if not check_individual_exists(new_ind):
+                return creator.Individual(new_ind)  # Certifique-se de que seja retornado um objeto Individual
+        attempts += 1
+    print("Máximo de tentativas de regeneração alcançado.")
+    return None
+
+# Opção 2 com pool
+def coordinates_exist(x, y):
+    x_native = x.item() if isinstance(x, np.generic) else x
+    y_native = y.item() if isinstance(y, np.generic) else y
+    tolerance = 1e-4
+
+    try:
+        conn = pool.get_connection()  # Obter uma conexão do pool
+        cursor = conn.cursor(buffered=True)
+
+        query = """
+        SELECT EXISTS(
+            SELECT 1 FROM `sensors`.tb_devices
+            WHERE ABS(coordenada_x - %s) <= %s
+            AND ABS(coordenada_y - %s) <= %s
+        )
+        """
+        cursor.execute(query, (x_native, tolerance, y_native, tolerance))
+        exists = cursor.fetchone()[0]
+
+        return bool(exists)
+    except mysql.connector.Error as e:
+        print(f"Erro no banco de dados: {e}")
+        return False
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+            
+# Salva o mapeamento de pais para filhos em um arquivo CSV
+def save_dodag_to_csv(children_map, dodag_csv):
+    with open(dodag_csv, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Parent', 'Children'])
+        for parent, children in children_map.items():
+            if not children:
+                children_str = '0'
+            else:
+                children_str = '; '.join([f"[{child[0]}, {child[1]}]" for child in children])
+            writer.writerow([f"[{parent[0]}, {parent[1]}]", children_str])
+
+def grid_search(toolbox, problem_instance, ref_points, db_config, pool, start_gen=0):    
+    results_df = pd.DataFrame()
+    pop = []  # Inicializa a variável pop como uma lista vazia de indivíduos bem-sucedidos
+    all_generations = []
+
+    try:
+        for eta in eta_range:
+            for eta2 in eta2_range:
+                for indpb in indpb_range:
+                    for cxpb in cxpb_range:
+                        for mutpb in mutpb_range:
+                            try:
+                                # Chamada da função de algoritmo genético
+                                pop, best_fitness, all_generations, pareto_front, pareto_front_2, ref_points, logbook, df_pareto_front, last_generation = run_genetic_algorithm(
+                                    toolbox, problem_instance, ref_points, cxpb, mutpb, db_config, pool, eta, eta2, indpb, start_gen=start_gen
+                                )
+                                
+                                if pareto_front_2:
+                                    print("Número de níveis de frentes de Pareto:", len(pareto_front_2))
+
+                                print("Logbook:")
+                                print(logbook)
+                                if not df_pareto_front.empty:
+                                    print("Primeiras linhas de df_pareto_front:")
+                                    print(df_pareto_front.head())
+                                
+                            except ValueError as e:
+                                print(f"2 - Erro ao calcular métricas: {e}")
+    except Exception as e:
+        print(f"1 - Erro na execução do grid search: {e}")
+    finally:
+        try:
+            # Conexão com o banco de dados e busca dos resultados
+            conn = pool.get_connection()
+            cursor = conn.cursor(buffered=True)
+            select_query = "SELECT * FROM `sensors`.tb_grid_search_results"
+            cursor.execute(select_query)
+            rows = cursor.fetchall()
+            results_df = pd.DataFrame(rows, columns=['id_grid_search_results', 'eta', 'eta2', 'indpb', 'cxpb', 'mutpb', 'best_fitness_str', 'gd', 'hypervolume', 'simulacao', 'generation'])
+            print("Resultados da pesquisa em grade:")
+            print(results_df)
+        except Error as e:
+            print(f"Erro ao buscar no MySQL: {e}")
+            results_df = pd.DataFrame()
+        finally:
+            if conn.is_connected():
+                cursor.close()
+                conn.close()
+    
+    return results_df, pop, all_generations, ref_points
+
+
+def insert_metric(pool, id_offspring_coordinates, sensor_id, node_id):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+        
+        query_template = """                
+            UPDATE `sensors`.tb_offspring_coordinates 
+            SET 
+                energest_cpu_j = (
+                    SELECT COALESCE(ROUND(AVG(CASE WHEN descricao = 'energest_cpu_mJ' THEN valor END) / 1000, 4), 0)
+                    FROM contikidb_tmp.sensor
+                    WHERE cenario = (SELECT cenario FROM contikidb_tmp.sensor ORDER BY id_experimento DESC LIMIT 1) 
+                      AND id_sensor = %s 
+                      AND descricao = 'energest_cpu_mJ'
+                ),
+                total_energy_consumption_j = (
+                    SELECT ROUND((
+                        COALESCE(AVG(CASE WHEN descricao = 'energest_cpu_mJ' THEN valor END), 0) +
+                        COALESCE(AVG(CASE WHEN descricao = 'radio_tx_energy_mJ' THEN valor END), 0) +
+                        COALESCE(AVG(CASE WHEN descricao = 'radio_rx_energy_mJ' THEN valor END), 0)
+                    ) / 1000, 4)
+                    FROM contikidb_tmp.sensor
+                    WHERE cenario = (SELECT cenario FROM contikidb_tmp.sensor ORDER BY id_experimento DESC LIMIT 1) 
+                      AND id_sensor = %s 
+                      AND descricao IN ('energest_cpu_mJ', 'radio_tx_energy_mJ', 'radio_rx_energy_mJ')
+                ),
+                latency_s = (
+                    SELECT COALESCE(ROUND(AVG(CASE WHEN descricao = 'Latency_ms' THEN valor END) / 1000, 4), 0)
+                    FROM contikidb_tmp.sensor
+                    WHERE cenario = (SELECT cenario FROM contikidb_tmp.sensor ORDER BY id_experimento DESC LIMIT 1) 
+                      AND id_sensor = %s 
+                      AND descricao = 'Latency_ms'
+                ),
+                total_data_volume_kb = (
+                    SELECT COALESCE(ROUND(SUM(valor) / 1000, 4), 0)
+                    FROM contikidb_tmp.sensor
+                    WHERE cenario = (SELECT cenario FROM contikidb_tmp.sensor ORDER BY id_experimento DESC LIMIT 1) 
+                      AND id_sensor = %s 
+                      AND descricao IN ('total_packets_received_is', 'total_packets_send_is')
+                ),
+                response_time_s = (
+                    SELECT COALESCE(ROUND(AVG(CASE WHEN ttime <> 0 THEN ttime END) / 1000, 4), 0)
+                    FROM contikidb_tmp.application
+                    WHERE cenario = (SELECT cenario FROM contikidb_tmp.application ORDER BY id DESC LIMIT 1) 
+                      AND node = %s
+                ),
+                transfer_rate_kb_s = (
+                    SELECT COALESCE(ROUND(AVG(CASE WHEN transfer_rate <> 0 THEN transfer_rate END), 4), 0)
+                    FROM contikidb_tmp.application
+                    WHERE cenario = (SELECT cenario FROM contikidb_tmp.application ORDER BY id DESC LIMIT 1) 
+                      AND node = %s
+                )
+            WHERE id_offspring_coordinates = %s;
+            """
+        
+        cursor.execute(query_template, (sensor_id, sensor_id, sensor_id, sensor_id, node_id, node_id, id_offspring_coordinates))
+        conn.commit()
+        print(f"Dados atualizados com sucesso para o ID: {id_offspring_coordinates}")
+        
+    except mysql.connector.Error as e:
+        print(f"Erro ao atualizar no MySQL o ID do dispositivo {id_offspring_coordinates}: {e}")
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conn' in locals() and conn.is_connected():
+            conn.close()
+
+def insert_metrics_to_db(pool):
+    # Obter os últimos 6 IDs de 'sensors.tb_offspring_coordinates', ordenados do menor para o maior
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT id_offspring_coordinates FROM `sensors`.tb_offspring_coordinates ORDER BY id_offspring_coordinates DESC LIMIT 6")
+        device_ids = [row[0] for row in cursor.fetchall()]
+        device_ids.sort()
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+    
+    print(f"Inserindo métricas obtidas na simulação no BD para o último indivíduo...")
+    
+    # Tempo total de execução de todas as threads
+    total_start_time = time.time()
+
+    # Executa inserções em paralelo
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = []
+        for i, id_offspring_coordinates in enumerate(device_ids):
+            sensor_id = i + 2
+            node_id = f'node{sensor_id}'
+            # Tempo de início da thread
+            thread_start_time = time.time()
+            # Submete o trabalho ao executor
+            futures.append((executor.submit(insert_metric, pool, id_offspring_coordinates, sensor_id, node_id), thread_start_time))
+        
+        # Aguarda a conclusão de todas as inserções e trata exceções
+        for future, start_time in futures:
+            try:
+                future.result()  # Isso levantará exceções, se houver
+                # Tempo de término da thread
+                thread_end_time = time.time()
+                thread_elapsed_time = thread_end_time - start_time
+                print(f"Thread completed in {thread_elapsed_time:.2f} seconds")
+            except Exception as e:
+                print(f"Erro ao inserir métrica: {e}")
+    
+    # Tempo total de execução de todas as threads
+    total_end_time = time.time()
+    total_elapsed_time = total_end_time - total_start_time
+    print(f"Total time taken for all threads: {total_elapsed_time:.2f} seconds")
+
+            
+# Esta função calcula a distância geracional (Generational Distance, GD), 
+# métrica usada em AG multiobjetivo para quantificar a qualidade da aproximação 
+# da população em relação à frente de Pareto referência. 
+def calculate_generational_distance(pop, pareto_front, maximize_indices):
+    if not pop:
+        raise ValueError("A população final está vazia.")
+    if not pareto_front:
+        raise ValueError("A frente de Pareto está vazia.")
+    
+    try:
+        # Converte os fitness values da população e da frente de Pareto em arrays numpy
+        population_points = np.array([ind.fitness.values for ind in pop])
+        pareto_front_points = np.array([ind.fitness.values for ind in pareto_front])
+
+        if population_points.ndim != 2 or pareto_front_points.ndim != 2:
+            raise ValueError("Os arrays de pontos devem ser 2D (matrizes)")
+
+        if population_points.shape[1] != pareto_front_points.shape[1]:
+            raise ValueError("O número de objetivos (colunas) deve ser o mesmo em ambos os arrays")
+
+        # Inverter as métricas de maximização para tratar todas as métricas como minimização
+        for idx in maximize_indices:
+            population_points[:, idx] = -population_points[:, idx]
+            pareto_front_points[:, idx] = -pareto_front_points[:, idx]
+
+        # Função para calcular a distância euclidiana entre dois pontos
+        def euclidean_distance(point1, point2):
+            return np.linalg.norm(point1 - point2)
+
+        # Calcula a distância mínima de cada ponto da população para a frente de Pareto
+        distances = [min(euclidean_distance(pop_point, pf_point) for pf_point in pareto_front_points)
+                     for pop_point in population_points]
+
+        # Calcula o GD como a média das distâncias mínimas
+        gd_value = np.mean(distances)
+
+        print(f"Distância Geracional: {gd_value}")
+
+        return gd_value
+
+    except Exception as e:
+        print("Erro durante o cálculo da distância geracional:", e)
+        raise ValueError(f"Erro ao calcular a distância geracional: {e}")
+
+    finally:
+        print("Limpeza finalizada após o cálculo da distância geracional.")
+
+# Hipervolume usando DEAP
+# Função de cálculo do hipervolume
+def calculate_hypervolume(pareto_front, ref_point, maximize_indices):
+    if not pareto_front:
+        raise ValueError("A frente de Pareto está vazia.")
+    if ref_point is None or not np.any(ref_point):
+        raise ValueError("O ponto de referência está vazio ou não definido.")
+    
+    pareto_front_points = np.array([ind.fitness.values for ind in pareto_front])
+    print(f"Pontos da Frente de Pareto (Original): {pareto_front_points}")
+    print(f"Ponto de Referência (Original): {ref_point}")
+    
+    # Ajusta os pontos de Pareto e o ponto de referência para considerar maximização/minimização
+    pareto_front_points_adj = np.copy(pareto_front_points)
+    ref_point_adj = np.copy(ref_point)
+    
+    for idx in maximize_indices:
+        pareto_front_points_adj[:, idx] = -pareto_front_points_adj[:, idx]
+        ref_point_adj[idx] = -ref_point_adj[idx]
+    
+    print(f"Pontos da Frente de Pareto (Ajustados): {pareto_front_points_adj}")
+    print(f"Ponto de Referência (Ajustado): {ref_point_adj}")
+    
+    # Calcular o hipervolume usando a função hv diretamente
+    hypervolume = hv.hypervolume(pareto_front_points_adj, ref_point_adj)
+    
+    print(f"Hipervolume Total: {hypervolume}")
+    return hypervolume
+
+# Função para obter o ponto de referência fixo
+def get_fixed_reference_point(pareto_front, maximize_indices, margin=1.0):    
+    pareto_front_points = np.array([ind.fitness.values for ind in pareto_front])
+    
+    # Inicialmente, calculamos o ponto de referência como o valor máximo de cada objetivo mais uma margem
+    ref_point = np.max(pareto_front_points, axis=0) + margin
+    
+    # Ajuste para os objetivos de maximização
+    for idx in maximize_indices:
+        ref_point[idx] = np.min(pareto_front_points[:, idx]) - margin
+    
+    # Arredonda os valores do ref_point para 4 casas decimais
+    ref_point = np.round(ref_point, 4)
+    
+    return ref_point
+
+def save_reference_point_to_db(ref_point, pool, simulacao, generation):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+        ref_point_str = json.dumps(ref_point.tolist())
+        cursor.execute("""
+            INSERT INTO `sensors`.tb_reference_point (ref_point, simulacao, generation)
+            VALUES (%s, %s, %s)
+        """, (ref_point_str, simulacao, generation))
+        conn.commit()
+        print("Ponto de referência salvo com sucesso.")
+    except mysql.connector.Error as e:
+        print(f"Erro ao salvar o ponto de referência no MySQL: {e}")
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+def load_reference_point_from_db(pool):
+    try:
+        conn = pool.get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("""
+            SELECT ref_point, simulacao, generation
+            FROM `sensors`.tb_reference_point
+            ORDER BY id_reference_point DESC
+            LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if row:
+            ref_point = np.array(json.loads(row[0]))
+            simulacao = row[1]
+            generation = row[2]
+            print("Ponto de referência carregado com sucesso.")
+            return ref_point, simulacao, generation
+        else:
+            print("Nenhum ponto de referência encontrado no banco de dados.")
+            return None, None, None
+    except mysql.connector.Error as e:
+        print(f"Erro ao carregar o ponto de referência do MySQL: {e}")
+        return None, None, None
+    finally:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+# Inicialização e execução do algoritmo genético
+def main(db_config):
+    # Inicializa o problema
+    problem = SensorPositioningProblem(db_config)
+    
+    # O conjunto de pontos de referência serve para orientar a evolução na criação de uma frente de Pareto uniforme no espaço objetivo.
+    ref_points = tools.uniform_reference_points(NOBJ, P)    
+    
+    # Setup DEAP Toolbox (Parâmetros AG)
+    toolbox = setup_toolbox(problem, ref_points, 5, 5, 0.6, 0.85, 0.6)
+    
+    # Assume uma geração de início padrão
+    start_gen = 0
+        
+    # Estabelece a conexão com o banco de dados
+    try:
+        conn = mysql.connector.connect(**db_config)
+        if conn.is_connected():
+            cursor = conn.cursor(buffered=True)
+
+            # Verifica se existe um estado salvo no banco de dados
+            cursor.execute("SELECT MAX(generation) FROM `sensors`.tb_state")
+            result = cursor.fetchone()
+            max_generation = result[0]
+
+            if max_generation is not None:
+                resume = input("Um estado de otimização salvo foi encontrado. Deseja continuar? (y/n/sair): ")
+
+                if resume.lower() == 'y':
+                    # Resetar nós antes de continuar a otimização.
+                    reset_processed_nodes(db_config)
+                    
+                    # Esta função (load_state_from_db) carrega o estado salvo de uma execução anterior do algoritmo evolutivo.
+                    pop, pareto_front, current_generation = load_state_from_db(conn)
+                    # Ajuste para continuar da próxima geração após o estado carregado.
+                    start_gen = current_generation + 1
+                                        
+                    print(f"Continuando da geração {current_generation}.")                                
+
+                elif resume.lower() == 'sair':
+                    print("Saindo do programa.")
+                    return
+                else:
+                    # Esta função apaga todos os registros da tabela 'sensors'.'tb_state' no BD MySQL limpando o "estado" salvo.
+                    clear_state_db(db_config)
+                    print("Iniciando um novo processo de otimização.")                    
+            else:
+                # Esta função apaga todos os registros da tabela 'sensors'.'tb_state' no BD MySQL limpando o "estado" salvo.
+                clear_state_db(db_config)  # Limpa a flag 'processed' para todos os dispositivos.
+                
+                cursor.execute("UPDATE `sensors`.tb_devices SET processed = FALSE")
+                conn.commit()
+                
+                print("Iniciando um novo processo de otimização.")                
+    except Error as e:
+        print(f"Erro ao verificar o estado salvo: {e}")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()   
+
+    results_df, pop, all_generations, ref_points = grid_search(toolbox, problem, ref_points, db_config, pool, start_gen)
+
+    logging.info("Finalizando Algoritmo Genético...")
+
+    
+if __name__ == '__main__':   
+    
+    start_time = time.time()  
+    
+    # Parâmetros de conexão SSH do servidor.
+    ssh_credentials = {
+        'hostname': '192.168.1.1',
+        'port': '22',
+        'username': 'aluno',
+        'password': 'XXXXX'    
+    }
+    
+    # Parâmetros de conexão com banco de dados    
+    DATABASE_CONFIG = {
+        'host': '127.0.0.1',
+        'database': 'sensors',  
+        'user': 'aluno',
+        'password': 'XXXX'
+        # "connection_timeout": 60,  # 60 segundos de timeout para inatividade
+        # "pool_reset_session": True  # Resetar a sessão ao devolver a conexão ao pool
+    }    
+    
+    # Cria um pool de conexões
+    pool_name = "mypool"
+    pool_size = 15  # Número máximo de conexões no pool
+
+    pool = pooling.MySQLConnectionPool(pool_name=pool_name,
+                                       pool_size=pool_size,
+                                       **DATABASE_CONFIG)
+
+    # Configuração para salvar os arquivos CSV no diretório especificado
+    base_path = "E:\\Downloads\\DODAG_Simulado"    
+    if not os.path.exists(base_path):
+        os.makedirs(base_path)
+        
+    dodag_csv = "C:\\Downloads\\tree_dodag_children.csv"    
+    
+    script_path = '/home/.../.../.../script_contiki-ng.sh'
+        
+    DECIMAL_PLACES = 4
+
+    # Ajuste os limites para cobrir todas as 12 coordenadas
+    XL = np.tile([-10.0, -70.0], 6)  # Repetir [-10.0, -70.0] 6 vezes
+    XU = np.tile([190.0, 90.0], 6)   # Repetir [190.0, 90.0] 6 vezes
+
+    # Verifica se as coordenadas estão dentro de limites predefinidos (MIN_X, MAX_X, MIN_Y, MIN_Y), retornando um fitness negativo se estiverem fora, indicando inaptidão.
+    # Aplicado na função 'evaluate_objective'.
+    MIN_X = -20.0
+    MAX_X = 200.0
+    
+    MIN_Y = -80.0
+    MAX_Y = 100.0
+
+    # O parâmetro P = 24 é usado para determinar o número de divisões ao longo de cada eixo na geração do ponto de referência para NSGA-III.
+    # Este parâmetro influencia diretamente a distribuição e densidade dos pontos de referência no espaço objetivo, que são cruciais para a manutenção da diversidade na população.
+    P = 36
+    # Número de gerações (NGEN).
+    NGEN = 1
+    # Número de Objetivos (NOBJ) = 6, especifica que o problema deve ser resolvido com seis objetivos.
+    NOBJ = 6
+    
+    # Aumentar o raio de alcance
+    MAX_DISTANCE = 75  # Aumente este valor para aumentar o alcance dos sensores
+
+    # Define intervalos para os Parâmetros AG.
+    # eta: O valor de eta para o cruzamento SBX geralmente fica entre 1 e 100.
+    # indpb: probabilidade de mutação independente para cada gene (ou parte do genótipo) de um indivíduo.
+    #        Valores típicos para indpb variam entre 0.05 e 0.3
+    # cxpb: Esse valor [0.9] indica que, a cada geração, há uma chance de 90% de que dois indivíduos selecionados sejam cruzados para produzir descendentes
+    # mutpb: Esse valor [0.5] indica que, em cada geração, há uma probabilidade de 50% de um indivíduo ser mutado.
+    eta_range = [5]
+    eta2_range = [5]    
+    indpb_range = [0.6]
+    cxpb_range = [0.85]
+    mutpb_range = [0.6]
+  
+    main(DATABASE_CONFIG)
+    
+    end_time = time.time()  
+    total_time_seconds = end_time - start_time 
+    
+    # Converte total_time_seconds em horas, minutos e segundos.
+    total_time_hours, remainder = divmod(total_time_seconds, 3600)
+    total_time_minutes, total_time_seconds = divmod(remainder, 60)
+
+    formatted_time = f"{int(total_time_hours):02d}:{int(total_time_minutes):02d}:{int(total_time_seconds):02d}"
+    print("-" * 60)
+    print(f"Tempo total de execução: {formatted_time}")
